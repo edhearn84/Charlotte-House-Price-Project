@@ -1,0 +1,111 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+# Dependencies
+
+```{r}
+
+rm(list = ls())
+
+library(tidyverse)
+library(readxl)
+library(lubridate)
+library(gridExtra)
+library(plm)
+library(lmtest)
+library(estimatr)
+library(miceadds)
+library(multiwayvcov)
+library(quantreg)
+library(psych)
+
+```
+
+# Data clean
+
+Data import - full Charlotte housing data
+
+```{r}
+
+# Import full Charlotte housing data
+load(file = "full_clt.Rdata")
+
+```
+
+Get data from MLS on condo prices
+
+```{r}
+
+load("clt_condos.Rdata")
+
+```
+
+Keep duplicates of CMS condo prices
+
+```{r}
+
+condos = Full_Charlotte_HousesCondos_Data_Set %>%
+  mutate( Address = str_replace_all(address , fixed(" ") , "") ,
+          Address = toupper(Address) ) %>%
+  group_by(Address) %>%
+  filter( n() > 1 )
+
+```
+
+
+
+```{r}
+
+match_data = full_clt_df %>%
+  select( subdiv , treat , `EOC Difference` ) %>%
+  group_by(subdiv) %>%
+  summarize( treat = mean(treat) , 
+             eoc_diff = mean(`EOC Difference` , na.rm = TRUE) )
+
+condo_joined = condos %>%
+  left_join(match_data , by = "subdiv")
+
+```
+
+Condo neighborhoods began to be recorded on 9/19/2003 (sparingly)
+
+Seperate files into pre-neighborhood and post-neighborhood era and join on address
+
+```{r}
+
+no_neigh_data = condo_joined %>%
+  filter(sold < "2003-09-19")
+
+neigh_data = condo_joined %>%
+  filter(sold >= "2003-09-19")
+
+```
+
+Join together two dataframes to get neighborhoods in
+
+```{r}
+
+neigh_replace = neigh_data %>%
+  select(Address , subdiv) %>%
+  right_join(no_neigh_data , by = "Address")
+
+```
+
+Examine for completeness and also to replace treatments and EOC Differences
+
+```{r}
+
+ndf = neigh_replace %>%
+  select( -subdiv.y ) %>%
+  bind_rows(neigh_data) %>%
+  select( Address , subdiv.x , treat , eoc_diff , everything() ) %>%
+  arrange( Address )
+
+#write_excel_csv(ndf , "ndf.csv")
+
+```
+
+
+

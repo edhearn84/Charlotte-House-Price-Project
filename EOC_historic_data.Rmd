@@ -1,0 +1,143 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+# Dependencies
+
+```{r}
+
+rm(list = ls())
+
+library(tidyverse)
+
+```
+
+# Data
+
+## Data Importation
+
+Load in data from "Disaggregated Results" into working environment - test score data
+
+```{r}
+
+eoc_path = "/Users/edwardhearn/Desktop/Stata Dissertation Files for Conversion to R/Charlotte House Price Project/CMS EOC Disagg Data"
+
+eoclist = list.files(path = "CMS EOC Disagg Data" , pattern = ".*_Data.txt")
+
+eocdata = lapply( file.path(eoc_path , eoclist) , function(x) {read.delim(x,header = TRUE,sep = "\t",dec = ".")} )
+
+```
+
+
+```{r}
+
+nameslist = list.files(path = "CMS EOC Disagg Data" , pattern = ".*_Schools.txt")
+
+namesdata = lapply( file.path(eoc_path , nameslist),function(x) {read.delim(x,header = TRUE,sep = "\t",dec = ".")} )
+
+
+```
+
+Add year indexing (specific dataframes from specific years)
+
+```{r}
+
+years = 2002:2010
+
+for ( i in seq_along(eocdata) ) {
+  eocdata[[i]]$year = rep( years[i] , nrow(eocdata[[i]]) )
+}
+
+```
+
+Bind rows into one unified dataframe for processing
+
+```{r}
+
+eoc_df = do.call("rbind" , eocdata)
+names_df = do.call("rbind" , namesdata)
+
+names = names_df %>%
+  group_by(school_code) %>%
+  slice(n())
+
+```
+
+## Data Processing
+
+```{r}
+
+# Filter to three EOCs of interest: Algebra I (A1), Biology (BI), and English I (E1)
+eoc_sub = eoc_df %>%
+  filter( subject %in% c("A1" , "BI" , "E1") & subgroup == "TOT" )
+
+```
+
+Join together EOC data and school names
+
+```{r}
+
+# Filter to specific CMS high schools under study (CMS school codes begin with "600")
+cms_hs = eoc_sub %>%
+  left_join( names , by = "school_code" ) %>%
+  filter( str_detect(school_code , "^600") & grade_span == "09-12" & assessment == "MC" ) %>%
+  select( school_code , school_name , everything() )
+
+cms_hs
+
+```
+
+Convert data to R format for ease/speed of coding results
+
+```{r}
+
+load(file = "cms_hs.Rdata")
+#save(cms_hs , file = "cms_hs.Rdata")
+
+```
+
+Get high school score averages
+
+```{r}
+
+cms_hs_scores = cms_hs %>%
+  select( school_code , school_name , subject , year , pct_prof , avg_score ) %>%
+  mutate( pct_pass = as.character(pct_prof) , 
+          pct_pass = ifelse(pct_pass == "<5" , 5 , pct_pass) ,
+          pct_pass = ifelse(pct_pass == ">95", 95 , pct_pass) ,
+          pct_pass = as.numeric(pct_pass) ) %>%
+  mutate( school_name = as.character(school_name) ,
+          school_name = ifelse( str_detect(school_name,"Olympic") , "Olympic High" , school_name) ,
+          school_name = ifelse( str_detect(school_name,"Garinger") , "Garinger High" , school_name) )
+
+cms_hs_scores %>% arrange(school_name)
+
+```
+
+Aggregate results to yearly composite of all three exams' passing rates per school
+
+```{r}
+
+# Aggregated over post-busing period
+cms_hs_scores %>%
+  filter(year >= 2002) %>%
+  group_by(school_name) %>%
+  summarize( pct_pass_composite = mean(pct_pass) )
+
+# Aggregated over post-busing period; broken out by subject
+cms_hs_scores %>%
+  filter(year >= 2002) %>%
+  group_by(school_name , subject) %>%
+  summarize( pct_pass_composite = mean(pct_pass) )
+
+# Yearly results
+cms_hs_scores %>%
+  filter(year >= 2002) %>%
+  group_by(school_name , year) %>%
+  summarize( pct_pass_composite = mean(pct_pass) )
+
+```
+
+
+

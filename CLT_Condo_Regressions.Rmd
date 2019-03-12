@@ -1,0 +1,184 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+# Dependencies
+
+```{r}
+
+rm(list = ls())
+
+library(tidyverse)
+library(readxl)
+library(lubridate)
+library(gridExtra)
+library(plm)
+library(lmtest)
+library(estimatr)
+library(miceadds)
+library(multiwayvcov)
+library(quantreg)
+library(psych)
+
+```
+
+Condos data after structuring and munge (see other R Markdown file, "Condos_CLT_proj.Rmd" for more explication and codes. Note: matched neighborhoods in Excel by hand pre- and post-busing).
+
+Saved ndf file as Rdata to avoid any chance that re-run of the last code will result in changes to this dataframe.
+
+```{r}
+
+load(file = "ndf.Rdata")
+
+```
+
+# Data clean
+
+Need to adjust nominal dollars to real dollars (2010$).
+
+```{r}
+
+# Load matched sample on houses to get adjustments for real list/sales prices from nominal list/sales prices.
+load(file = "matched_clt.Rdata")
+
+# Yearly adjustments for dollars
+yearly_dols_adj = matched_clt_df %>%
+  mutate( daily = ymd(sold) ,
+          year_fe = factor(year(daily)) ) %>%
+  select( year_fe , `2010$ Rate` ) %>%
+  group_by(year_fe) %>%
+  summarize( adj = mean(`2010$ Rate`) )
+
+# Merge in with condos dataframe and create variables
+condos = ndf %>%
+  mutate( daily = ymd(sold) ,
+          new = ifelse(new_construct == "Yes" , 1 , 0) ,
+          age = 2010 - year_built ,
+          agesq = age^2 ,
+          year_fe = factor(year(daily)) ) %>%
+  left_join(yearly_dols_adj , by = "year_fe" ) %>%
+  mutate( rsp = sp / adj ,
+          rlp = lp / adj , 
+          lrsp = log(rsp) ,
+          lrlp = log(rlp) )
+
+```
+
+# Regression analyses
+
+## Linear DiD models
+
+Treatment and timing variables
+
+```{r}
+
+# Treatments are categorical here (0,1 and interactions) and for date sold before/after rezoning
+treated_df = condos %>%
+  mutate( year_fe = factor(year(daily)) ) %>% 
+  # First are neighborhood treatments
+  mutate( rezone = ifelse(treat == 1 | treat == 2 , 1 , 0) ) %>%
+  # Next are date treatments
+  mutate( post2002 = ifelse(sold < "2002-04-15", 0 , 1) ) %>%
+  # Interaction of two is treatment, positive treatment, and negative treatment
+  mutate( treat = rezone*post2002 )
+
+# Positively treated dataframe
+treated_pos_df = condos %>%
+  filter( treat %in% c(0,1) ) %>%
+  mutate( year_fe = factor(year(daily)) ) %>% 
+  # First are neighborhood treatments
+  mutate( rezonepos = ifelse(treat == 1 , 1 , 0) ) %>%
+  # Next are date treatments
+  mutate( post2002 = ifelse(sold < "2002-04-15", 0 , 1) ) %>%
+  # Interaction of two is treatment, positive treatment, and negative treatment
+  mutate( treatpos = rezonepos*post2002 ,
+          eocptreat = eoc_diff*treatpos)
+
+# Negatively treated dataframe
+treated_neg_df = condos %>%
+  filter( treat %in% c(0,2) ) %>%
+  mutate( year_fe = factor(year(daily)) ) %>% 
+  # First are neighborhood treatments
+  mutate( rezoneneg = ifelse(treat == 2 , 1 , 0) ) %>%
+  # Next are date treatments
+  mutate( post2002 = ifelse(sold < "2002-04-15", 0 , 1) ) %>%
+  # Interaction of two is treatment, positive treatment, and negative treatment
+  mutate( treatneg = rezoneneg*post2002 ,
+          eocntreat = eoc_diff*treatneg)
+
+```
+
+Simple first-pass regressions without hedonic covariates
+
+```{r}
+
+# Full treatment (aggregating both positive and negative treatment effects)
+simp_reg = lm( lrsp ~ rezone + post2002 + treat , data = treated_df)
+summary(simp_reg)
+
+# Overall treatment
+summary( lm_robust(lrsp ~ rezone + post2002 + treat , 
+                data = treated_df , 
+                se_type = "stata") )
+
+# Positively treated 
+summary( lm_robust(lrsp ~ rezonepos + post2002 + treatpos , 
+                data = treated_pos_df , 
+                se_type = "stata") )
+
+# Negatively treated
+summary( lm_robust(lrsp ~ rezoneneg + post2002 + treatneg , 
+                data = treated_neg_df , 
+                se_type = "stata") )
+
+```
+
+Hedonic regression results. Pared down covariates due to being condos rather than houses (some covariates do not make sense in condo context)
+
+```{r}
+
+# Positively treated 
+summary(lm_robust(
+  lrsp ~ rezonepos + post2002 + treatpos + beds + total_hla + new + age + agesq , 
+                data = treated_pos_df , 
+                se_type = "stata") )
+
+# Negatively treated
+summary( lm_robust(
+  lrsp ~ rezoneneg + post2002 + treatneg + beds + total_hla + age + agesq , 
+                data = treated_neg_df , 
+                se_type = "stata") )
+
+```
+
+### EOC-treatment regressions
+
+```{r}
+
+# Positively treated base model
+summary( lm_robust(lrsp ~ eoc_diff + post2002 + eocptreat, 
+                data = treated_pos_df , 
+                se_type = "stata") )
+
+# Negatively treated base model
+summary( lm_robust(lrsp ~ eoc_diff + post2002 + eocntreat, 
+                data = treated_neg_df , 
+                se_type = "stata") )
+
+```
+
+```{r}
+
+# Positively treated base model
+summary( lm_robust(lrsp ~ eoc_diff + post2002 + eocptreat + beds + total_hla + new + age + agesq , 
+                data = treated_pos_df , 
+                se_type = "stata") )
+
+# Negatively treated base model
+summary( lm_robust(lrsp ~ eoc_diff + post2002 + eocntreat + beds + total_hla + age + agesq , 
+                data = treated_neg_df , 
+                se_type = "stata") )
+
+```
+

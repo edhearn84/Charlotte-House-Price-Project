@@ -1,0 +1,913 @@
+---
+title: "Full Charlotte Data Codes"
+output: html_notebook
+---
+
+# Dependencies
+
+```{r}
+
+rm(list = ls())
+
+library(tidyverse)
+library(readxl)
+library(lubridate)
+library(gridExtra)
+library(plm)
+library(lmtest)
+library(estimatr)
+library(miceadds)
+library(multiwayvcov)
+library(quantreg)
+library(psych)
+
+```
+
+# Data clean
+
+Data import - full Charlotte housing data
+
+```{r}
+
+# Import full Charlotte housing data
+load(file = "full_clt.Rdata")
+
+```
+
+Examine EOC Composite scores by high school and year
+
+```{r}
+
+eoc = full_clt_df %>%
+  mutate( year = year(sold) ) %>%
+  group_by(high , year) %>%
+  summarize(eoc_comp = mean(`EOC Composite`) )
+
+eoc
+
+```
+
+Add a ranking variable for plotting (1997 ranks and where these go year over year)
+
+```{r}
+
+# Numeric rank by 1998 passing rates
+eoc_ranks = eoc %>%
+  filter(year == 1998) %>%
+  arrange( desc(eoc_comp) )
+
+# Sub in ranks, leaving one out for EE Waddell (2002 scores subbed for 1998)
+eoc_ranks = cbind( eoc_ranks , rank = c(1:8,10:14) )
+
+# Merge ranks in with yearly eoc pass rates by high school
+eoc_rank_years = eoc_ranks %>%
+  select(high , rank) %>%
+  right_join( eoc , by = "high" ) %>%
+  mutate( rank = ifelse(high == "E.E. Waddell" , 9 , rank) ,
+          short_high = paste0(str_sub(high,1,1) , str_sub(high,-1)) )
+
+eoc_rank_names = eoc_rank_years %>%
+  filter(high != "Harding University") %>%
+  group_by(year) %>%
+  arrange( year , desc(eoc_comp) ) %>%
+  mutate( yr_rank = rank(eoc_comp , ties.method = "first") ) %>%
+  na.omit()
+
+eoc_rank_names
+
+```
+
+Visualize results of EOC passing rate rankings
+
+```{r}
+
+png("Figures & Visuals/eoc_school_numeric_rankings.png" , width = 900 , height = 500)
+
+plot( x = eoc_rank_years$year , y = eoc_rank_years$eoc_comp , type = "n" , xaxt = "n" ,
+      xlab = "" , ylab = "EOC Passing Rate" )
+text( x = jitter(eoc_rank_years$year,2) , y = eoc_rank_years$eoc_comp , 
+      labels = eoc_rank_years$rank , cex = 0.8 )
+axis( 1 , at = 1997:2010 , labels = FALSE , tick = FALSE)
+text( x = 1997:2010 , par("usr")[3] - 0.5 , 
+     labels = 1997:2010 , srt = 35 , pos = 1 , xpd = TRUE) 
+for ( i in c(1997:2009) ) {
+  abline( v = i + 0.5 , lty = 2 , col = "gray" )
+}
+
+dev.off()
+
+```
+
+Rankings by school names
+
+```{r}
+
+png("Figures & Visuals/eoc_school_rankings.png" , width = 900 , height = 500)
+
+plot( x = eoc_rank_names$year , y = eoc_rank_names$yr_rank , type = "n" , xaxt = "n" , yaxt = "n" ,
+      xlab = "" , ylab = " " )
+text( x = eoc_rank_names$year , y = eoc_rank_names$yr_rank , 
+      labels = eoc_rank_names$short_high , cex = 1 , 
+      col = round(eoc_rank_names$rank^0.5,0) )
+axis( 1 , at = 1997:2010 , labels = FALSE , tick = FALSE)
+text( x = 1997:2010 , par("usr")[3] - 0.5 , 
+     labels = 1997:2010 , srt = 35 , pos = 1 , xpd = TRUE) 
+
+dev.off()
+
+```
+
+Clean and format data on Charlotte house prices - full data 
+
+```{r}
+
+# Filter on conditions that aren't realistic for houses in full Charlotte dataframe
+full_clt = full_clt_df %>%
+  rename(eoccomposite = `EOC Composite` ,
+         eocdifference = `EOC Difference` ,
+         half_baths = `half baths`) %>%
+  mutate( daily = ymd(sold) ,
+          new = ifelse(new_construct == "Yes" , 1 , 0) ,
+          age = 2010 - year_built ,
+          agesq = age^2 ,
+          lrsp = log(rsp) ,
+          lrlp = log(rlp) ) %>%
+  filter( !(baths > 6) ) %>%
+  filter( !(acres > 10) ) %>%
+  filter( !(age < 0) ) %>%
+  filter( !(age > 200) ) %>%
+  filter( !(total_hla == 0) ) %>%
+  filter( !(baths == 0 & half_baths == 0) ) %>%
+  filter( !(baths == 0) ) %>%
+  filter( !(beds < 1) ) %>%
+  filter( !(rsp < 1000) ) %>%
+  filter( !(treat == 1 & eocdifference < 0) ) %>%
+  filter( !(treat == 2 & eocdifference > 0) ) #%>% # Comment/uncomment full data/subset data to filter new hs in cms
+  #filter(daily <= "2006-08-01")
+
+```
+
+# DiD summary statistics
+
+Take a look at difference-in-difference tables: 
+
+```{r}
+
+# Control Neighborhoods
+# Pre-busing:
+cpreb = c( mean(full_clt$rsp[full_clt$treat == 0 & full_clt$daily <= "2002-04-15"]) , 
+           length( full_clt$rsp[full_clt$treat == 0 & full_clt$daily <= "2002-04-15"]) )
+# Post-busing:
+cpostb = c( mean(full_clt$rsp[full_clt$treat == 0 & full_clt$daily > "2002-04-15"]) ,
+            length(full_clt$rsp[full_clt$treat == 0 & full_clt$daily > "2002-04-15"]) )
+
+# Positively treated neighborhoods
+# Pre-busing
+ppreb = c( mean(full_clt$rsp[full_clt$treat == 1 & full_clt$daily <= "2002-04-15"]) , 
+           length(full_clt$rsp[full_clt$treat == 1 & full_clt$daily <= "2002-04-15"]) )
+# Post-busing
+ppostb = c( mean(full_clt$rsp[full_clt$treat == 1 & full_clt$daily > "2002-04-15"]) , 
+            length(full_clt$rsp[full_clt$treat == 1 & full_clt$daily > "2002-04-15"]) )
+
+# Negatively treated neighborhoods
+# Pre-busing
+npreb = c( mean(full_clt$rsp[full_clt$treat == 2 & full_clt$daily <= "2002-04-15"]) , 
+           length(full_clt$rsp[full_clt$treat == 2 & full_clt$daily <= "2002-04-15"]) )
+# Post-busing
+npostb = c( mean(full_clt$rsp[full_clt$treat == 2 & full_clt$daily > "2002-04-15"]) , 
+            length(full_clt$rsp[full_clt$treat == 2 & full_clt$daily > "2002-04-15"]) )
+
+```
+
+Gather results into differences-in-differences table (with housing totals)
+
+``` {r}
+
+# Pre-busing tibble
+pre = t( tibble(
+  cpreb, 
+  ppreb , 
+  npreb
+) )
+
+# Post-busing tibble
+post = t( tibble(
+  cpostb , 
+  ppostb , 
+  npostb
+) )
+
+# Wrap results into data frame
+DiD = data.frame( cbind(post , pre) )
+
+# Naming conventions: rows and columns
+rnames = c("control","positive","negative")
+
+diff_in_diff = DiD %>%
+  select( X1 , X3 , X2 , X4 ) %>%
+  rename( post_bus_rsp = X1 , 
+          pre_bus_rsp = X3 ,
+          post_bus_n = X2 , 
+          pre_bus_n = X4 ) %>%
+  mutate( prepost_diffs = post_bus_rsp - pre_bus_rsp )
+
+rownames(diff_in_diff) = rnames
+diff_in_diff
+
+```
+
+# Visualizations
+
+House prices over time
+
+Aggregate positively and negatively treated and control groups of houses by each month during timeframe
+
+```{r}
+
+# Aggregate lrsp data to lrsp averages for each day during sample timeframe (positive treatment and control groups)
+monthly_lrsp_pos = full_clt %>% 
+  filter( treat %in% c(0,1) ) %>%
+  mutate( monthly = month(daily) ,
+          yearly = year(daily) ,
+          yearmon = ymd(paste0(yearly,"-",monthly,"-01")) ) %>%
+  group_by(yearmon , treat) %>%
+  summarize( lrsp = mean(lrsp) ,
+             n = n() ) 
+
+# Aggregate lrsp data to lrsp averages for each day during sample timeframe (negative treatment and control groups)
+monthly_lrsp_neg = full_clt %>% 
+  filter( treat %in% c(0,2) ) %>%
+  mutate( monthly = month(daily) ,
+          yearly = year(daily) ,
+          yearmon = ymd(paste0(yearly,"-",monthly,"-01")) ) %>%
+  group_by(yearmon , treat) %>%
+  summarize( lrsp = mean(lrsp) ) 
+
+```
+
+Visualize aggregates of positive/control and negative/control houses
+
+``` {r}
+
+# Visual display of daily lrsp averages over timeframe - positive treatment and control
+pos = monthly_lrsp_pos %>%
+  ggplot( aes(x = yearmon , y = lrsp , color = as.factor(treat)) ) + 
+  geom_point() +
+  theme_bw() +
+  scale_x_date( breaks = scales::pretty_breaks(20) ) +
+  scale_y_continuous(limits = c(11,14.5)) +
+  annotate(geom = "text" , x = ymd("2008-04-17") , y = 13 , label = "Positive" , col = "#00BFC4" , size = 5) +
+  annotate(geom = "text" , x = ymd("2008-04-17") , y = 12 , label = "Control" , col = "#F8766D" , size = 5) +
+  theme( axis.text.x = element_text(angle = 45 , hjust = 1) ,
+         legend.position = "n" ,
+         panel.grid = element_blank() ,
+         axis.text=element_text(size=14) ,
+         axis.title=element_text(size=14,face="bold") ) +
+  labs( x = "" ,
+        y = "ln(real sale price)" ,
+        color = "" ,
+        title = "Positively Treated vs Control Houses") +
+  geom_vline(xintercept = ymd("2002-04-01") , col = "gray" , lty = 2) +
+  annotate( "text" , x = ymd("2003-01-01") , y = 14.5 , label = "04/15/2002" , col = "gray" , size = 5)
+
+# Visual display of daily lrsp averages over timeframe - negative treatment and control
+neg = monthly_lrsp_neg %>%
+  ggplot( aes(x = yearmon , y = lrsp , color = as.factor(treat)) ) + 
+  geom_point() +
+  theme_bw() +
+  scale_x_date( breaks = scales::pretty_breaks(20) ) +
+  scale_y_continuous(limits = c(11,14.5)) +
+  annotate(geom = "text" , x = ymd("2007-04-17") , y = 13 , label = "Control" , col = "#F8766D" , size = 5) +
+  annotate(geom = "text" , x = ymd("2007-04-17") , y = 11.7 , label = "Negative" , col = "#00BFC4" , size = 5) +
+  theme( axis.text.x = element_text(angle = 45, hjust = 1) ,
+         legend.position = "n" ,
+         panel.grid = element_blank() ,
+         axis.text=element_text(size=14) ,
+         axis.title=element_text(size=14,face="bold") ) +
+  labs( x = "" ,
+        y = "ln(real sale price)" ,
+        color = "" ,
+        title = "Negatively Treated vs Control Houses") +
+  geom_vline(xintercept = ymd("2002-04-01") , col = "gray" , lty = 2) +
+  annotate( "text" , x = ymd("2003-01-01") , y = 14.5 , label = "04/15/2002" , col = "gray" , size = 5)
+
+png("pos_house_price_plots.png" , width = 900 , height = 500)
+pos
+dev.off()
+
+png("neg_house_price_plots.png" , width = 900 , height = 500)
+neg
+dev.off()
+
+```
+
+Plot simple month-over-month trend lines and overlay on to plot
+
+``` {r}
+
+# Visual display of daily lrsp averages over timeframe - positive treatment and control
+pos = monthly_lrsp_pos %>%
+  ggplot( aes(x = yearmon , y = lrsp , color = factor(treat)) ) + 
+  geom_point(alpha = 0.3) +  
+  geom_smooth( data = subset(monthly_lrsp_pos , yearmon < "2002-05-01") ,
+               aes( x = yearmon , y = lrsp , color = factor(treat) ) , method = lm , se = FALSE ) +
+  geom_smooth( data = subset(monthly_lrsp_pos , yearmon >= "2002-05-01") ,
+               aes( x = yearmon , y = lrsp , color = factor(treat) ) , method = lm , se = FALSE ) +
+  theme_bw() +
+  scale_x_date( breaks = scales::pretty_breaks(20) ) +
+  scale_y_continuous(limits = c(11,14.5)) +
+  annotate(geom = "text" , x = ymd("2008-04-17") , y = 13 , label = "Positive" , col = "#00BFC4" , size = 5) +
+  annotate(geom = "text" , x = ymd("2008-04-17") , y = 12 , label = "Control" , col = "#F8766D" , size = 5) +
+  theme( axis.text.x = element_text(angle = 45, hjust = 1) ,
+         legend.position = "n" ,
+         panel.grid = element_blank() ,
+         axis.text=element_text(size=14),
+         axis.title=element_text(size=14,face="bold") ) +
+  labs( x = "" ,
+        y = "ln(real sale price)" ,
+        color = "" ,
+        title = "") +
+  geom_vline(xintercept = ymd("2002-04-01") , col = "gray" , lty = 2) +
+  annotate( "text" , x = ymd("2003-01-01") , y = 14.5 , label = "04/15/2002" , col = "gray" , size = 5)
+
+# Visual display of daily lrsp averages over timeframe - negative treatment and control
+neg = monthly_lrsp_neg %>%
+  ggplot( aes(x = yearmon , y = lrsp , color = as.factor(treat)) ) + 
+  geom_point(alpha = 0.3) +
+  theme_bw() +
+  geom_smooth( data = subset(monthly_lrsp_neg , yearmon < "2002-05-01") ,
+               aes( x = yearmon , y = lrsp , color = factor(treat) ) , method = lm , se = FALSE ) +
+  geom_smooth( data = subset(monthly_lrsp_neg , yearmon >= "2002-05-01") ,
+               aes( x = yearmon , y = lrsp , color = factor(treat) ) , method = lm , se = FALSE ) +
+  scale_x_date( breaks = scales::pretty_breaks(20) ) +
+  scale_y_continuous(limits = c(11,14.5)) +
+  annotate(geom = "text" , x = ymd("2007-04-17") , y = 13 , label = "Control" , col = "#F8766D" , size = 5) +
+  annotate(geom = "text" , x = ymd("2007-04-17") , y = 11.7 , label = "Negative" , col = "#00BFC4" , size = 5) +
+  theme( axis.text.x = element_text(angle = 45, hjust = 1) ,
+         legend.position = "n" ,
+         panel.grid = element_blank() ,
+         axis.text=element_text(size=14),
+         axis.title=element_text(size=14,face="bold") ) +
+  labs( x = "" ,
+        y = "ln(real sale price)" ,
+        color = "" ,
+        title = "") +
+  geom_vline(xintercept = ymd("2002-04-01") , col = "gray" , lty = 2) +
+  annotate( "text" , x = ymd("2003-01-01") , y = 14.5 , label = "04/15/2002" , col = "gray" , size = 5 )
+
+png("pos_house_price_trends.png" , width = 900 , height = 500)
+pos
+dev.off()
+
+png("neg_house_price_trends.png" , width = 900 , height = 500)
+neg
+dev.off()
+
+```
+
+Notes: 
+
+- Data issues from MLS in late 1999 to early 2001 obfuscate empirical trend lines and house prices (average monthly house prices during this period calculated from small numbers of house sales, sometimes 1, 2, 3. Some months have no house sales). Had this data not been lost, would have seen sharper patterns and likely closer trend lines without such a disparate drop down. Story here is in the slopes, not the immediate effects! (Lottery offset these)
+
+- Trends essentially parallel in positive/control pre-busing period; clear change in trends afterward, with positive control group of neighborhood-houses continuing upward trajectory, while control switch tack. Also, large drop-down relative to positively treated neighborhoods indicates bigger negative effect at first and then substantial on-going effects from change in school assignment policy. People bidding up house prices in these areas relative to control houses (which are fall in house price post-busing).
+
+- Negative trends tell another side of the story: no immediate effects for negatiely treated houses relative to controls; negative slope didn't change much either. Control slope, as before, is (would be less) slightly positive until busing decision, then gradually negative afterward. Negative prices bid down slightly faster in post-busing era. 
+
+# Regression analyses
+
+Linear models encapsulate both dummy-treatment and EOC-difference treatment.
+
+Set up variables for treatment and control groups (positively and negatively treated). This requires dummies for treated (positively and negatively) and date sold (pre- and post-April 15, 2002).
+
+```{r}
+
+# Treatments are categorical here (0,1 and interactions) and for date sold before/after rezoning
+treated_df = full_clt %>%
+  mutate( year_fe = factor(year(daily)) ) %>% 
+  # First are neighborhood treatments
+  mutate( rezone = ifelse(treat == 1 | treat == 2 , 1 , 0) ) %>%
+  # Next are date treatments
+  mutate( post2002 = ifelse(sold < "2002-04-15", 0 , 1) ) %>%
+  # Interaction of two is treatment, positive treatment, and negative treatment
+  mutate( treat = rezone*post2002 )
+
+# Positively treated dataframe
+treated_pos_df = full_clt %>%
+  filter( treat %in% c(0,1) ) %>%
+  mutate( year_fe = factor(year(daily)) ) %>% 
+  # First are neighborhood treatments
+  mutate( rezonepos = ifelse(treat == 1 , 1 , 0) ) %>%
+  # Next are date treatments
+  mutate( post2002 = ifelse(sold < "2002-04-15", 0 , 1) ) %>%
+  # Interaction of two is treatment, positive treatment, and negative treatment
+  mutate( treatpos = rezonepos*post2002 ,
+          eocptreat = eocdifference*treatpos)
+
+# Negatively treated dataframe
+treated_neg_df = full_clt %>%
+  filter( treat %in% c(0,2) ) %>%
+  mutate( year_fe = factor(year(daily)) ) %>% 
+  # First are neighborhood treatments
+  mutate( rezoneneg = ifelse(treat == 2 , 1 , 0) ) %>%
+  # Next are date treatments
+  mutate( post2002 = ifelse(sold < "2002-04-15", 0 , 1) ) %>%
+  # Interaction of two is treatment, positive treatment, and negative treatment
+  mutate( treatneg = rezoneneg*post2002 ,
+          eocntreat = eocdifference*treatneg)
+
+```
+
+## Validation measure: logistic regression
+
+Logistic regression of whether school board assigned worse performing schools into treated neighborhoods
+
+```{r}
+
+treat_df = treated_df %>%
+  mutate(treat = rezone*post2002)
+
+# Total treated
+(mod_logit = summary(glm( treat ~ scale(SAT) + scale(eoccomposite) + scale(TEOC) , data = treat_df , family = binomial(link = "logit") )))
+# MFX
+for (i in 2:4) {
+  print( arm::invlogit(mod_logit$coefficients[1] + mod_logit$coefficients[i]) - arm::invlogit(mod_logit$coefficients[1]) )
+}
+
+# Positively treated
+(mod_logit_pos = summary(glm( treatpos ~ scale(SAT) + scale(eoccomposite) + scale(TEOC) , data = treated_pos_df , family = binomial(link = "logit") )))
+# MFX
+for (i in 2:4) {
+  print( arm::invlogit(mod_logit_pos$coefficients[1] + mod_logit_pos$coefficients[i]) - arm::invlogit(mod_logit_pos$coefficients[1]) )
+}
+
+# Negatively treated
+(mod_logit_neg = summary(glm( treatneg ~ scale(SAT) + scale(eoccomposite) + scale(TEOC) , data = treated_neg_df , family = binomial(link = "logit") )))
+# MFX
+for (i in 2:4) {
+  print( arm::invlogit(mod_logit_neg$coefficients[1] + mod_logit_neg$coefficients[i]) - arm::invlogit(mod_logit_neg$coefficients[1]) )
+}
+
+```
+
+Aggregate scores and standard deviations on measures above.
+
+```{r}
+
+mean(treated_pos_df$eoccomposite , na.rm = TRUE)
+mean(treated_pos_df$SAT , na.rm = TRUE)
+mean(treated_pos_df$TEOC , na.rm = TRUE)
+
+sd(treated_pos_df$eoccomposite , na.rm = TRUE)
+sd(treated_pos_df$SAT , na.rm = TRUE)
+sd(treated_pos_df$TEOC , na.rm = TRUE)
+
+```
+
+## Linear DiD models
+
+Simple first-pass regressions without hedonic covariates
+
+```{r}
+
+# Full treatment (aggregating both positive and negative treatment effects)
+simp_reg = lm( lrsp ~ rezone + post2002 + treat , data = treated_df)
+summary(simp_reg)
+
+# Overall treatment
+summary( lm_robust(lrsp ~ rezone + post2002 + treat , 
+                data = treated_df , 
+                se_type = "stata" ,
+                clusters = treated_df$subdiv) )
+
+# Positively treated 
+summary( lm_robust(lrsp ~ rezonepos + post2002 + treatpos , 
+                data = treated_pos_df , 
+                se_type = "stata" ,
+                clusters = treated_pos_df$subdiv) )
+
+# Negatively treated
+summary( lm_robust(lrsp ~ rezoneneg + post2002 + treatneg , 
+                data = treated_neg_df , 
+                se_type = "stata" ,
+                clusters = treated_neg_df$subdiv) )
+
+```
+
+Incorporate hedonic variables into the analyses
+
+```{r}
+
+# Overall treatment
+summary( lm_robust(
+  lrsp ~ rezone + post2002 + treat + acres + beds + baths + half_baths + new + age + agesq + year_fe , 
+                data = treated_df ,
+                se_type = "stata" ,
+                clusters = treated_df$subdiv) )
+
+# Treatment-by-year
+summary( lm_robust(
+  lrsp ~ rezone + acres + beds + baths + half_baths + new + age + agesq + year_fe + year_fe*rezone , 
+                data = treated_df ,
+                se_type = "stata" ,
+                clusters = treated_df$subdiv) )
+
+```
+
+Positive treatment regression results by total and year-over-year
+
+```{r}
+
+# Positively treated 
+summary(lm_robust(
+  lrsp ~ rezonepos + post2002 + treatpos + acres + beds + baths + half_baths + new + age + agesq + year_fe , 
+                data = treated_pos_df , 
+                se_type = "stata" ,
+                clusters = treated_pos_df$subdiv) )
+
+# Year-over-year
+summary(lm_robust(
+  lrsp ~ rezonepos + acres + beds + baths + half_baths + new + age + agesq + year_fe + year_fe*rezonepos , 
+                data = treated_pos_df , 
+                se_type = "stata" ,
+                clusters = treated_pos_df$subdiv) )
+
+```
+
+Negative treatment regression results by total and year-over-year
+
+``` {r}
+
+# Negatively treated
+summary( lm_robust(
+  lrsp ~ rezoneneg + post2002 + treatneg + acres + beds + baths + half_baths + new + age + agesq + year_fe , 
+                data = treated_neg_df , 
+                se_type = "stata" ,
+                clusters = treated_neg_df$subdiv) )
+
+# Year-over-year
+summary( lm_robust(
+  lrsp ~ rezoneneg + acres + beds + baths + half_baths + new + age + agesq + year_fe + rezoneneg*year_fe , 
+                data = treated_neg_df , 
+                se_type = "stata" ,
+                clusters = treated_neg_df$subdiv) )
+
+```
+
+Incorporate EOC-difference (or "doseage") model for houses in neighborhoods that experienced positive and negative treatment effects of a school reassignment: base models
+
+```{r}
+
+# Positively treated base model
+summary( lm_robust(lrsp ~ eocdifference + post2002 + eocptreat, 
+                data = treated_pos_df , 
+                se_type = "stata" ,
+                clusters = treated_pos_df$subdiv) )
+
+# Year-over-year base model
+summary( lm_robust(lrsp ~ eocdifference + year_fe + eocdifference*year_fe, 
+                data = treated_pos_df , 
+                se_type = "stata" ,
+                clusters = treated_pos_df$subdiv) )
+
+# Negatively treated base model
+summary( lm_robust(lrsp ~ eocdifference + post2002 + eocntreat, 
+                data = treated_neg_df , 
+                se_type = "stata" ,
+                clusters = treated_neg_df$subdiv) )
+
+# Year-over-year base model
+summary( lm_robust(lrsp ~ eocdifference + post2002 + eocntreat, 
+                data = treated_neg_df , 
+                se_type = "stata" ,
+                clusters = treated_neg_df$subdiv) )
+
+```
+
+Hedonic house attributes models: EOC-difference treatments
+
+```{r}
+
+# Positively treated EOC-difference
+summary(lm_robust(
+  lrsp ~ eocdifference + post2002 + eocptreat + acres + beds + baths + half_baths + new + age + agesq + year_fe , 
+                data = treated_pos_df , 
+                se_type = "stata" ,
+                clusters = treated_pos_df$subdiv) )
+
+# Year-over-year EOC-difference
+pos_yearly = lm_robust(
+  lrsp ~ eocdifference + acres + beds + baths + half_baths + new + age + agesq + year_fe + eocdifference*year_fe , 
+                data = treated_pos_df , 
+                se_type = "stata" ,
+                clusters = treated_pos_df$subdiv)
+
+# Negatively treated EOC-difference
+summary( lm_robust(
+  lrsp ~ eocdifference + post2002 + eocntreat + acres + beds + baths + half_baths + new + age + agesq + year_fe , 
+                data = treated_neg_df , 
+                se_type = "stata" ,
+                clusters = treated_neg_df$subdiv) )
+
+# Year-over-year EOC-difference
+neg_yearly = lm_robust(
+  lrsp ~ eocdifference + acres + beds + baths + half_baths + new + age + agesq + year_fe + eocdifference*year_fe , 
+                data = treated_neg_df , 
+                se_type = "stata" ,
+                clusters = treated_neg_df$subdiv)
+
+```
+
+Delineate variables needed for plotting
+
+```{r}
+
+# Positive/negative treatment effects
+yfx_pos = pos_yearly$coefficients[23:length(pos_yearly$coefficients)]
+yfx_neg = neg_yearly$coefficients[23:length(neg_yearly$coefficients)]
+
+# Positive/negative standard errors
+sefx_pos = pos_yearly$std.error[23:length(pos_yearly$std.error)]
+sefx_neg = neg_yearly$std.error[23:length(neg_yearly$std.error)]
+
+# Years
+years = 1998:2010
+
+```
+
+Positive-treatment yearly effects plot with CI bars
+
+``` {r}
+
+png("pos_fx_yearly.png" , width = 900 , height = 500)
+
+# Delineate tick marks for years
+xtick = 1998:2010
+
+# Plot of yearly effects with 2 SE (95% CI) bars
+plot( y = yfx_pos , x = years , type = "b" , pch = 16 , ylim = c(-.05,.02) , xaxt = "n" , 
+xlab = "" , ylab = "Estimate" , main = "Positive Treatment Coefficient Estimates: EOC Differences" , 
+las = 1 , mgp = c(3.3,1,0) )
+axis( 1 , at = 1998:2010 , labels = FALSE )
+text( x = xtick , par("usr")[3] - 0.004 , 
+     labels = xtick , srt = 35 , pos = 1 , xpd = TRUE) 
+for ( i in 1:length(years) ) {
+  ci = yfx_pos[i] + c(-2,2)*sefx_pos[i]
+  x = years[i]
+  lines( c(x,x) , ci )
+}
+abline( h = 0 )
+abline( v = 2002+(105/365) , lty = 2 , col = "gray" )
+text( x = 2003 , y = .02 , labels = "4/15/2002" , col = "gray" )
+
+dev.off()
+
+```
+
+Negative-treatment yearly effects plot with CI bars
+
+```{r}
+
+png("neg_fx_yearly.png" , width = 900 , height = 500)
+
+# Delineate tick marks for years
+xtick = 1998:2010
+
+# Plot of yearly effects with 2 SE (95% CI) bars
+plot( y = yfx_neg , x = years , type = "b" , ylim = c(-.03,.01) , pch = 16 , xaxt = "n" , 
+      xlab = "" , main = "Negative Treatment Coefficient Estimates: EOC Differences" , ylab = "Estimate" ,
+      las = 1 , mgp = c(3.3,1,0) )
+axis(1 , at = 1998:2010 , labels = FALSE)
+text(x = xtick,  par("usr")[3] - 0.002, 
+     labels = xtick, srt = 35, pos = 1, xpd = TRUE)
+for ( i in 1:length(years) ) {
+  ci = yfx_neg[i] + c(-2,2)*sefx_neg[i]
+  x = years[i]
+  lines( c(x,x) , ci )
+}
+abline( h = 0 )
+abline( v = 2002+(105/365) , lty = 2 , col = "gray" )
+text( x = 2003 , y = .01 , labels = "4/15/2002" , col = "gray") 
+
+dev.off()
+
+```
+
+## Regressions by EOC quantiles
+
+Quantiles of EOC differences
+
+```{r}
+
+# Postively treated EOC-difference quantiles
+quantile( treated_pos_df$eocptreat[treated_pos_df$eocptreat != 0] , 
+          probs = c(.25 , .50 , .75) , 
+          na.rm = TRUE )
+
+# Negatively treated EOC-difference quantiles
+quantile( treated_neg_df$eocntreat[treated_neg_df$eocntreat != 0] , 
+          probs = c(.25 , .50 , .75) , 
+          na.rm = TRUE )
+
+```
+
+Apply same models to treatment quantiles (break treatment into bottom 25%, middle 50%, and top 25% of EOC difference totals)
+
+Positive model results: EOC quantiles
+
+```{r}
+
+# Positively treated houses quantiles of EOC-difference scores
+quant_pos_df = treated_pos_df %>%
+  mutate( eocp25 = ifelse(eocdifference != 0 & eocdifference <= 6.93 , 1 , 0) ,
+          eocp50 = ifelse(6.93 < eocdifference & eocdifference < 32.3 , 1 , 0) ,
+          eocp75 = ifelse(32.3 <= eocdifference , 1 , 0) )
+
+# Bottom 25% of EOC differences
+quant_pos_25 = quant_pos_df %>%
+  filter( eocp25 == 1 | eocdifference == 0 )
+
+# Middle 50% of EOC differences
+quant_pos_50 = quant_pos_df %>%
+  filter( eocp50 == 1 | eocdifference == 0 )
+
+# Upper 25% of EOC differences
+quant_pos_75 = quant_pos_df %>%
+  filter( eocp75 == 1 | eocdifference == 0 )
+
+# Linear model incorporating all three treatment effects
+
+# Bottom 25%
+summary(lm_robust(
+  lrsp ~ eocdifference + post2002 + eocptreat + acres + beds + baths + half_baths + new + age + agesq + year_fe , 
+                data = quant_pos_25 , 
+                se_type = "stata" ,
+                clusters = quant_pos_25$subdiv) )
+
+# Middle 50%
+summary(lm_robust(
+  lrsp ~ eocdifference + post2002 + eocptreat + acres + beds + baths + half_baths + new + age + agesq + year_fe , 
+                data = quant_pos_50 , 
+                se_type = "stata" ,
+                clusters = quant_pos_50$subdiv) )
+
+# Upper 75%
+summary(lm_robust(
+  lrsp ~ eocdifference + post2002 + eocptreat + acres + beds + baths + half_baths + new + age + agesq + year_fe , 
+                data = quant_pos_75 , 
+                se_type = "stata" ,
+                clusters = quant_pos_75$subdiv) )
+
+```
+
+Negative model results: EOC quantiles
+
+```{r}
+
+# Positively treated houses quantiles of EOC-difference scores
+quant_neg_df = treated_neg_df %>%
+  mutate( eocn25 = ifelse(eocdifference != 0 & eocdifference <= -19.83 , 1 , 0) ,
+          eocn50 = ifelse(-3.16 > eocdifference & eocdifference > -19.83 , 1 , 0) ,
+          eocn75 = ifelse( -3.16 <= eocdifference , 1 , 0) )
+
+# Bottom 25% of EOC differences
+quant_neg_25 = quant_neg_df %>%
+  filter( eocn25 == 1 | eocdifference == 0 )
+
+# Middle 50% of EOC differences
+quant_neg_50 = quant_neg_df %>%
+  filter( eocn50 == 1 | eocdifference == 0 )
+
+# Upper 25% of EOC differences
+quant_neg_75 = quant_neg_df %>%
+  filter( eocn75 == 1 | eocdifference == 0 )
+
+# Linear model incorporating all three treatment effects
+
+# Bottom 25%
+summary(lm_robust(
+  lrsp ~ eocdifference + post2002 + eocntreat + acres + beds + baths + half_baths + new + age + agesq + year_fe , 
+                data = quant_neg_25 , 
+                se_type = "stata" ,
+                clusters = quant_neg_25$subdiv) )
+
+# Middle 50%
+summary(lm_robust(
+  lrsp ~ eocdifference + post2002 + eocntreat + acres + beds + baths + half_baths + new + age + agesq + year_fe , 
+                data = quant_neg_50 , 
+                se_type = "stata" ,
+                clusters = quant_neg_50$subdiv) )
+
+# Upper 75%
+summary(lm_robust(
+  lrsp ~ eocdifference + post2002 + eocntreat + acres + beds + baths + half_baths + new + age + agesq + year_fe , 
+                data = quant_neg_75 , 
+                se_type = "stata" ,
+                clusters = quant_neg_75$subdiv) )
+
+```
+
+## Quantile regressions across house-price distribution
+
+Positively treated houses across 10% quantiles of house-price distribution
+
+```{r}
+
+quant_pos = rq( 
+  lrsp ~ rezonepos + post2002 + treatpos + acres + beds + baths + half_baths + new + age + agesq + year_fe ,
+  data = treated_pos_df , 
+  tau = seq(.1,.9,by=.1) )
+
+quant_pos
+
+```
+
+Boostrap neighborhood-clustered standard errors across quantile regressions
+
+```{r}
+
+# # Specify neighborhood clusters
+# neigh_clust = as.factor(treated_pos_df$subdiv[-1])
+# 
+# # Specify quantiles 
+# quants = seq(0.1 , 0.9 , by = 0.1)
+# 
+# # Calculate CI bands and store in empty array
+# qr_array = array(NA , c(nrow = length(quants) , ncol = 2))
+# 
+# for ( i in 1:length(quants) ) {
+#   qr_b = boot.rq(x = quant_pos$x , y = quant_pos$y , tau = quants[i] , R = 500 , cluster = neigh_clust)
+#   qr_array[i,] = quantile(qr_b$B[,4] , probs = c(.025,.975) )
+# }
+
+```
+
+Plot quantile regression results with 95% bootstrapped and neighborhood-clustered CIs
+
+```{r}
+
+# # Plot results and 95% clustered, bootstrap CIs
+# plot(quant_pos$coefficients[4,] , ylim = range(qr_array) , pch = 16 , xaxt = "n" ,
+#      ylab = "Coefficient estimate" , xlab = "Quantile" , main = "Positively Treated House Price Effects: Quantile Regressions")
+# axis(1 , at = seq(1,9,by=1) , labels = seq(.1,.9,by=.1))
+# lines(qr_array[,1] , lty = 2)
+# lines(qr_array[,2] , lty = 2)
+# abline(h = 0)
+
+```
+
+Negatively treated houses across 10% quantiles of house price distribution
+
+```{r}
+
+quant_neg = rq( 
+  lrsp ~ rezoneneg + post2002 + treatneg + acres + beds + baths + half_baths + new + age + agesq + year_fe ,
+  data = treated_neg_df , 
+  tau = seq(.1,.9,by=.1) )
+
+quant_neg
+
+```
+
+Boostrap neighborhood-clustered standard errors across quantile regressions
+
+```{r}
+
+# # Specify neighborhood clusters
+# neigh_clust = as.factor(treated_neg_df$subdiv[-1])
+# 
+# # Specify quantiles 
+# quants = seq(0.1 , 0.9 , by = 0.1)
+# 
+# # Calculate CI bands and store in empty array
+# qr_array = array(NA , c(nrow = length(quants) , ncol = 2))
+# 
+# for ( i in 1:length(quants) ) {
+#   qr_b = boot.rq(x = quant_neg$x , y = quant_neg$y , tau = quants[i] , R = 500 , cluster = neigh_clust)
+#   qr_array[i,] = quantile(qr_b$B[,4] , probs = c(.025,.975) )
+# }
+
+```
+
+Plot quantile regression results with 95% bootstrapped and neighborhood-clustered CIs
+
+```{r}
+
+# plot(quant_neg$coefficients[4,] , ylim = range(qr_array) , pch = 16 , xaxt = "n" ,
+#      ylab = "Coefficient estimate" , xlab = "Quantile" , main = "Negatively Treated House Price Effects: Quantile Regressions")
+# axis(1 , at = seq(1,9,by=1) , labels = seq(.1,.9,by=.1))
+# lines(qr_array[,1] , lty = 2)
+# lines(qr_array[,2] , lty = 2)
+# abline(h = 0)
+
+```
+
+
+```{r}
+
+describe(full_clt)
+describe(treated_df$eocdifference[treated_df$eocdifference != 0])
+describe(treated_pos_df$eocdifference[treated_pos_df$treat == 1])
+describe(treated_neg_df$eocdifference[treated_neg_df$treat == 2])
+
+```
+

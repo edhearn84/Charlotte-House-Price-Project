@@ -1,0 +1,422 @@
+---
+title: "Matched Charlotte Data Codes"
+output: html_notebook
+---
+
+# Dependencies
+
+```{r}
+
+rm(list = ls())
+
+library(tidyverse)
+library(readxl)
+library(lubridate)
+library(gridExtra)
+library(plm)
+library(lmtest)
+library(estimatr)
+library(miceadds)
+library(multiwayvcov)
+library(quantreg)
+
+```
+
+# Data clean
+
+Data import - matched Charlotte housing data
+
+```{r}
+
+# Import matched Charlotte housing data
+load(file = "matched_clt.Rdata")
+
+```
+
+Clean and format data on Charlotte house prices - matched address data 
+
+```{r}
+
+# Filter on conditions that aren't realistic for houses in full Charlotte dataframe
+matched_clt = matched_clt_df %>%
+  rename(eoccomposite = `EOC Composite` ,
+         eocdifference = `EOC Difference` ,
+         half_baths = `half baths`) %>%
+  mutate( daily = ymd(sold) ,
+          new = ifelse(new_construct == "Yes" , 1 , 0) ,
+          age = 2010 - year_built ,
+          agesq = age^2 ,
+          lrsp = log(rsp) ,
+          lrlp = log(rlp) ) %>%
+  filter( !(baths > 6) ) %>%
+  filter( !(acres > 10) ) %>%
+  filter( !(age < 0) ) %>%
+  filter( !(age > 200) ) %>%
+  filter( !(total_hla == 0) ) %>%
+  filter( !(baths == 0 & half_baths == 0) ) %>%
+  filter( !(baths == 0) ) %>%
+  filter( !(beds < 1) ) %>%
+  filter( !(rsp < 1000) ) %>%
+  filter( !(treat == 1 & eocdifference < 0) ) %>%
+  filter( !(treat == 2 & eocdifference > 0) ) #%>% # Comment/uncomment full data/subset data to filter new hs in cms
+  #filter(daily <= "2006-08-01")
+
+```
+
+# Regression analyses
+
+## Linear DiD models
+
+Linear models encapsulate both dummy-treatment and EOC-difference treatment.
+
+Set up variables for treatment and control groups (positively and negatively treated). This requires dummies for treated (positively and negatively) and date sold (pre- and post-April 15, 2002).
+
+```{r}
+
+# Treatments are categorical here (0,1 and interactions) and for date sold before/after rezoning
+treated_df = matched_clt %>%
+  mutate( year_fe = factor(year(daily)) ) %>% 
+  # First are neighborhood treatments
+  mutate( rezone = ifelse(treat == 1 | treat == 2 , 1 , 0) ) %>%
+  # Next are date treatments
+  mutate( post2002 = ifelse(sold < "2002-04-15", 0 , 1) ) %>%
+  # Interaction of two is treatment, positive treatment, and negative treatment
+  mutate( treat = rezone*post2002 )
+
+# Positively treated dataframe
+treated_pos_df = matched_clt %>%
+  filter( treat %in% c(0,1) ) %>%
+  mutate( year_fe = factor(year(daily)) ) %>% 
+  # First are neighborhood treatments
+  mutate( rezonepos = ifelse(treat == 1 , 1 , 0) ) %>%
+  # Next are date treatments
+  mutate( post2002 = ifelse(sold < "2002-04-15", 0 , 1) ) %>%
+  # Interaction of two is treatment, positive treatment, and negative treatment
+  mutate( treatpos = rezonepos*post2002 ,
+          eocptreat = eocdifference*treatpos)
+
+# Negatively treated dataframe
+treated_neg_df = matched_clt %>%
+  filter( treat %in% c(0,2) ) %>%
+  mutate( year_fe = factor(year(daily)) ) %>% 
+  # First are neighborhood treatments
+  mutate( rezoneneg = ifelse(treat == 2 , 1 , 0) ) %>%
+  # Next are date treatments
+  mutate( post2002 = ifelse(sold < "2002-04-15", 0 , 1) ) %>%
+  # Interaction of two is treatment, positive treatment, and negative treatment
+  mutate( treatneg = rezoneneg*post2002 ,
+          eocntreat = eocdifference*treatneg)
+
+```
+
+Simple first-pass regressions without hedonic covariates
+
+```{r}
+
+# Full treatment (aggregating both positive and negative treatment effects)
+simp_reg = lm( lrsp ~ rezone + post2002 + treat , data = treated_df)
+summary(simp_reg)
+
+# Overall treatment
+summary( lm_robust(lrsp ~ rezone + post2002 + treat , 
+                data = treated_df , 
+                se_type = "stata") )
+
+# Positively treated 
+summary( lm_robust(lrsp ~ rezonepos + post2002 + treatpos , 
+                data = treated_pos_df , 
+                se_type = "stata") )
+
+# Negatively treated
+summary( lm_robust(lrsp ~ rezoneneg + post2002 + treatneg , 
+                data = treated_neg_df , 
+                se_type = "stata") )
+
+```
+
+Incorporate hedonic variables into the analyses
+
+```{r}
+
+# Overall treatment
+summary( lm_robust(
+  lrsp ~ rezone + post2002 + treat + acres + beds + baths + half_baths + new + age + agesq + year_fe , 
+                data = treated_df ,
+                se_type = "stata") )
+
+# Treatment-by-year
+summary( lm_robust(
+  lrsp ~ rezone + acres + beds + baths + half_baths + new + age + agesq + year_fe + year_fe*rezone , 
+                data = treated_df ,
+                se_type = "stata") )
+
+```
+
+Positive treatment regression results by total and year-over-year
+
+```{r}
+
+# Positively treated 
+summary(lm_robust(
+  lrsp ~ rezonepos + post2002 + treatpos + acres + beds + baths + half_baths + new + age + agesq + year_fe , 
+                data = treated_pos_df , 
+                se_type = "stata") )
+
+# Year-over-year
+summary(lm_robust(
+  lrsp ~ rezonepos + acres + beds + baths + half_baths + new + age + agesq + year_fe + year_fe*rezonepos , 
+                data = treated_pos_df , 
+                se_type = "stata") )
+
+```
+
+Negative treatment regression results by total and year-over-year
+
+``` {r}
+
+# Negatively treated
+summary( lm_robust(
+  lrsp ~ rezoneneg + post2002 + treatneg + acres + beds + baths + half_baths + new + age + agesq + year_fe , 
+                data = treated_neg_df , 
+                se_type = "stata") )
+
+# Year-over-year
+summary( lm_robust(
+  lrsp ~ rezoneneg + acres + beds + baths + half_baths + new + age + agesq + year_fe + rezoneneg*year_fe , 
+                data = treated_neg_df , 
+                se_type = "stata") )
+
+```
+
+Incorporate EOC-difference (or "doseage") model for houses in neighborhoods that experienced positive and negative treatment effects of a school reassignment: base models
+
+```{r}
+
+# Positively treated base model
+summary( lm_robust(lrsp ~ eocdifference + post2002 + eocptreat, 
+                data = treated_pos_df , 
+                se_type = "stata") )
+
+# Year-over-year base model
+summary( lm_robust(lrsp ~ eocdifference + year_fe + eocdifference*year_fe, 
+                data = treated_pos_df , 
+                se_type = "stata") )
+
+# Negatively treated base model
+summary( lm_robust(lrsp ~ eocdifference + post2002 + eocntreat, 
+                data = treated_neg_df , 
+                se_type = "stata") )
+
+# Year-over-year base model
+summary( lm_robust(lrsp ~ eocdifference + post2002 + eocdifference*year_fe, 
+                data = treated_neg_df , 
+                se_type = "stata") )
+
+```
+
+Hedonic house attributes models: EOC-difference treatments
+
+```{r}
+
+# Positively treated EOC-difference
+summary(lm_robust(
+  lrsp ~ eocdifference + post2002 + eocptreat + acres + beds + baths + half_baths + new + age + agesq + year_fe , 
+                data = treated_pos_df , 
+                se_type = "stata") )
+
+# Year-over-year EOC-difference
+pos_yearly = lm_robust(
+  lrsp ~ eocdifference + acres + beds + baths + half_baths + new + age + agesq + year_fe + eocdifference*year_fe , 
+                data = treated_pos_df , 
+                se_type = "stata")
+
+# Negatively treated EOC-difference
+summary( lm_robust(
+  lrsp ~ eocdifference + post2002 + eocntreat + acres + beds + baths + half_baths + new + age + agesq + year_fe , 
+                data = treated_neg_df , 
+                se_type = "stata") )
+
+# Year-over-year EOC-difference
+neg_yearly = lm_robust(
+  lrsp ~ eocdifference + acres + beds + baths + half_baths + new + age + agesq + year_fe + eocdifference*year_fe , 
+                data = treated_neg_df , 
+                se_type = "stata")
+
+```
+
+## Regressions by EOC quantiles
+
+Quantiles of EOC differences
+
+```{r}
+
+# Postively treated EOC-difference quantiles
+quantile( treated_pos_df$eocptreat[treated_pos_df$eocptreat != 0] , 
+          probs = c(.25 , .50 , .75) , 
+          na.rm = TRUE )
+
+# Negatively treated EOC-difference quantiles
+quantile( treated_neg_df$eocntreat[treated_neg_df$eocntreat != 0] , 
+          probs = c(.25 , .50 , .75) , 
+          na.rm = TRUE )
+
+```
+
+Apply same models to treatment quantiles (break treatment into bottom 25%, middle 50%, and top 25% of EOC difference totals)
+
+Positive model results: EOC quantiles
+
+```{r}
+
+# Positively treated houses quantiles of EOC-difference scores
+quant_pos_df = treated_pos_df %>%
+  mutate( eocp25 = ifelse(eocdifference != 0 & eocdifference <= 6.93 , 1 , 0) ,
+          eocp50 = ifelse(6.93 < eocdifference & eocdifference < 32.3 , 1 , 0) ,
+          eocp75 = ifelse(32.3 <= eocdifference , 1 , 0) )
+
+# Bottom 25% of EOC differences
+quant_pos_25 = quant_pos_df %>%
+  filter( eocp25 == 1 | eocdifference == 0 )
+
+# Middle 50% of EOC differences
+quant_pos_50 = quant_pos_df %>%
+  filter( eocp50 == 1 | eocdifference == 0 )
+
+# Upper 25% of EOC differences
+quant_pos_75 = quant_pos_df %>%
+  filter( eocp75 == 1 | eocdifference == 0 )
+
+# Linear model incorporating all three treatment effects
+
+# Bottom 25%
+summary(lm_robust(
+  lrsp ~ eocdifference + post2002 + eocptreat + acres + beds + baths + half_baths + new + age + agesq + year_fe , 
+                data = quant_pos_25 , 
+                se_type = "stata") )
+
+# Middle 50%
+summary(lm_robust(
+  lrsp ~ eocdifference + post2002 + eocptreat + acres + beds + baths + half_baths + new + age + agesq + year_fe , 
+                data = quant_pos_50 , 
+                se_type = "stata") )
+
+# Upper 75%
+summary(lm_robust(
+  lrsp ~ eocdifference + post2002 + eocptreat + acres + beds + baths + half_baths + new + age + agesq + year_fe , 
+                data = quant_pos_75 , 
+                se_type = "stata") )
+
+```
+
+Negative model results: EOC quantiles
+
+```{r}
+
+# Positively treated houses quantiles of EOC-difference scores
+quant_neg_df = treated_neg_df %>%
+  mutate( eocn25 = ifelse(eocdifference != 0 & eocdifference <= -9.97 , 1 , 0) ,
+          eocn50 = ifelse(-3.19 > eocdifference & eocdifference > -9.97 , 1 , 0) ,
+          eocn75 = ifelse( -3.19 <= eocdifference , 1 , 0) )
+
+# Bottom 25% of EOC differences
+quant_neg_25 = quant_neg_df %>%
+  filter( eocn25 == 1 | eocdifference == 0 )
+
+# Middle 50% of EOC differences
+quant_neg_50 = quant_neg_df %>%
+  filter( eocn50 == 1 | eocdifference == 0 )
+
+# Upper 25% of EOC differences
+quant_neg_75 = quant_neg_df %>%
+  filter( eocn75 == 1 | eocdifference == 0 )
+
+# Linear model incorporating all three treatment effects
+
+# Bottom 25%
+summary(lm_robust(
+  lrsp ~ eocdifference + post2002 + eocntreat + acres + beds + baths + half_baths + new + age + agesq + year_fe , 
+                data = quant_neg_25 , 
+                se_type = "stata") )
+
+# Middle 50%
+summary(lm_robust(
+  lrsp ~ eocdifference + post2002 + eocntreat + acres + beds + baths + half_baths + new + age + agesq + year_fe , 
+                data = quant_neg_50 , 
+                se_type = "stata") )
+
+# Upper 75%
+summary(lm_robust(
+  lrsp ~ eocdifference + post2002 + eocntreat + acres + beds + baths + half_baths + new + age + agesq + year_fe , 
+                data = quant_neg_75 , 
+                se_type = "stata") )
+
+```
+
+## Quantile regressions across house-price distribution
+
+Positively treated houses across 10% quantiles of house-price distribution
+
+```{r}
+
+quant_pos = rq( 
+  lrsp ~ rezonepos + post2002 + treatpos + acres + beds + baths + half_baths + new + age + agesq + year_fe ,
+  data = treated_pos_df , 
+  tau = seq(.1,.9,by=.1) )
+
+summary(quant_pos)
+
+```
+
+Boostrap neighborhood-clustered standard errors across quantile regressions
+
+```{r}
+
+# Specify quantiles
+quants = seq(0.1 , 0.9 , by = 0.1)
+
+# Calculate CI bands and store in empty array
+qr_array = array(NA , c(nrow = length(quants) , ncol = 2))
+
+for ( i in 1:length(quants) ) {
+  qr_b = boot.rq(x = quant_pos$x , y = quant_pos$y , tau = quants[i] , R = 500)
+  qr_array[i,] = quantile(qr_b$B[,4] , probs = c(.025,.975) )
+}
+
+qr_array
+
+```
+
+
+```{r}
+
+quant_neg = rq( 
+  lrsp ~ rezoneneg + post2002 + treatneg + acres + beds + baths + half_baths + new + age + agesq + year_fe ,
+  data = treated_neg_df , 
+  tau = seq(.1,.9,by=.1) )
+
+quant_neg
+
+```
+
+```{r}
+
+# Specify quantiles
+quants = seq(0.1 , 0.9 , by = 0.1)
+
+# Calculate CI bands and store in empty array
+qr_array = array(NA , c(nrow = length(quants) , ncol = 2))
+
+for ( i in 1:length(quants) ) {
+  qr_b = boot.rq(x = quant_neg$x , y = quant_neg$y , tau = quants[i] , R = 500)
+  qr_array[i,] = quantile(qr_b$B[,4] , probs = c(.025,.975) )
+}
+
+qr_array
+
+```
+
+
+
+
+
+
